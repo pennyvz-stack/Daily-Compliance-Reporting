@@ -1,52 +1,59 @@
 # ==============================================================================
-# DAILY COMMIT COMPLIANCE REPORT - FORCED TODAY TEST
+# DAILY COMMIT COMPLIANCE REPORT - LOCAL INGESTION + LOCAL TIME WINDOW
 # ==============================================================================
 
-# ---- CONFIG ----
-$owner      = "pennyvz-stack"
-$repo       = "Daily-Compliance-Reporting"
-$ghPat      = "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"
+# ---- 1. CORE CONFIGURATION ----
+$owner = "pennyvz-stack"
+$repo  = "Daily-Compliance-Reporting"
 
-# SMTP Mail Settings (Gmail Relay)
-$smtpServer = "smtp.gmail.com"
-$smtpPort   = 587
-$emailTo    = "pennyvz@gmail.com"
-$emailFrom  = "pennyvz@gmail.com" 
+# ---- 2. SECURE INTERACTIVE CREDENTIAL PROMPT ----
+Write-Host "====================================================" -ForegroundColor Cyan
+Write-Host "   DAILY COMMIT REPORT - SMTP SECURITY AUTH" -ForegroundColor Cyan
+Write-Host "====================================================" -ForegroundColor Cyan
+Write-Host ""
 
-# Secure Mail Credentials
-$gmailUser    = "pennyvz@gmail.com"
-$gmailAppPass = "yfeykmhetvmmookl" 
-$SecurePassword = ConvertTo-SecureString $gmailAppPass -AsPlainText -Force
-$smtpCredential = New-Object System.Management.Automation.PSCredential($gmailUser, $SecurePassword)
+# Prompt safely for your fresh Gmail App Password
+$gmailUser = "pennyvz@gmail.com"
+Write-Host "Please enter your fresh Gmail App Password for email relay:" -ForegroundColor Yellow
+$smtpCredential = Get-Credential -UserName $gmailUser -Message "Gmail SMTP Gateway Authentication"
 
-# ---- FORCED FORCE FOR TODAY TESTING ----
-# Bypassing the rolling check so it looks strictly at today's calendar date
+# ---- 3. TARGET WINDOW CONFIGURATION (PURE LOCAL TIME) ----
 $targetDate = (Get-Date).Date
-$fromDate = $targetDate.ToString("yyyy-MM-ddT00:00:00Z")
-$toDate   = $targetDate.ToString("yyyy-MM-ddT23:59:59Z")
+$fromDate   = $targetDate.ToString("yyyy-MM-dd 00:00:00")
+$toDate     = $targetDate.ToString("yyyy-MM-dd 23:59:59")
 
-# ---- GITHUB API REST DATA INGESTION ----
-$headers = @{
-    "Authorization" = "token $ghPat"
-    "Accept"        = "application/vnd.github.v3+json"
+# ---- 4. LOCAL GIT LOG INGESTION ----
+$response = @()
+try {
+    Set-Location "C:\Daily-Compliance-Reporting"
+    $gitCommits = git log --since="$fromDate" --until="$toDate" --format="%ae|%aI"
+    
+    foreach ($line in $gitCommits) {
+        if ($line) {
+            $parts = $line -split '\|'
+            $response += [PSCustomObject]@{
+                commit = [PSCustomObject]@{
+                    author = [PSCustomObject]@{
+                        email = $parts[0].Trim()
+                        date  = $parts[1].Trim()
+                    }
+                }
+            }
+        }
+    }
+    Write-Host "Success: Loaded commits directly from local Git tracking repository!" -ForegroundColor Green
+} catch {
+    Write-Host "Failed to query local Git repository logs: $_" -ForegroundColor Red
 }
-$url = "https://api.github.com/repos/$owner/$repo/commits?since=$fromDate&until=$toDate&per_page=100"
 
-try { 
-    $response = Invoke-RestMethod -Uri $url -Headers $headers 
-} catch { 
-    Write-Host "GitHub API call failed: $_" -ForegroundColor Red
-    $response = @() 
-}
-
-# ---- DYNAMIC DEVELOPER ROSTER (SQL SERVER) ----
+# ---- 5. DYNAMIC DEVELOPER ROSTER (SQL SERVER) ----
 $sqlServer = "DESKTOP-LQEABPI\TEST" 
 $database  = "DBA_Tools"
 $query     = "SELECT DeveloperEmail, TimeZoneID FROM dbo.DeveloperRegistry WHERE IsActive = 1"
 
 try {
     $dbRoster = Invoke-SqlCmd -ServerInstance $sqlServer -Database $database -Query $query
-    $developers = $dbRoster.DeveloperEmail
+    $developers = @($dbRoster.DeveloperEmail)
     $developerTimeZones = @{}
     foreach ($row in $dbRoster) { $developerTimeZones[$row.DeveloperEmail] = $row.TimeZoneID }
 } catch {
@@ -54,21 +61,26 @@ try {
     exit
 }
 
-# ---- DATA COMPUTATION & TIME ZONE TRANSLATION ----
+# ---- 6. CASE-INSENSITIVE DATA COMPUTATION ----
 $commitCounts = @{}; $lastCommitLocal = @{}
 foreach ($dev in $developers) { $commitCounts[$dev] = 0; $lastCommitLocal[$dev] = $null }
 
 foreach ($commit in $response) {
     $email = $commit.commit.author.email
     $timestamp = [DateTime]$commit.commit.author.date
-    if ($commitCounts.ContainsKey($email)) {
-        $commitCounts[$email]++
-        $localTime = [TimeZoneInfo]::ConvertTimeFromUtc($timestamp.ToUniversalTime(), [TimeZoneInfo]::FindSystemTimeZoneById($developerTimeZones[$email]))
-        if ($lastCommitLocal[$email] -eq $null -or $localTime -gt $lastCommitLocal[$email]) { $lastCommitLocal[$email] = $localTime }
+    
+    if ($developers -contains $email) {
+        $matchedKey = ($commitCounts.Keys | Where-Object { $_ -eq $email })
+        $commitCounts[$matchedKey]++
+        
+        $localTime = [TimeZoneInfo]::ConvertTimeFromUtc($timestamp.ToUniversalTime(), [TimeZoneInfo]::FindSystemTimeZoneById($developerTimeZones[$matchedKey]))
+        if ($lastCommitLocal[$matchedKey] -eq $null -or $localTime -gt $lastCommitLocal[$matchedKey]) { 
+            $lastCommitLocal[$matchedKey] = $localTime 
+        }
     }
 }
 
-# ---- REPORT HTML GENERATION ----
+# ---- 7. REPORT HTML GENERATION ----
 $reportDate = $targetDate.ToString("yyyy-MM-dd")
 $tableRows = ""
 $sortedDevs = $developers | Sort-Object { $lastCommitLocal[$_] } -Descending
@@ -95,10 +107,10 @@ $emailBody += "<tbody>$tableRows</tbody></table>"
 $emailBody += "<p style='font-size: 11px; color: #777; margin-top: 25px;'>This is an automated database administration report.</p>"
 $emailBody += "</body></html>"
 
-# ---- MAIL TRANSMISSION ----
+# ---- 8. MAIL TRANSMISSION ----
 try {
-    Send-MailMessage -SmtpServer $smtpServer -Port $smtpPort -To $emailTo -From $emailFrom -Subject "Daily Commit Compliance Report - $reportDate" -Body $emailBody -BodyAsHtml -Encoding Utf8 -Credential $smtpCredential -UseSsl
-    Write-Host "Success: Forced today-view email dispatched." -ForegroundColor Green
+    Send-MailMessage -SmtpServer "smtp.gmail.com" -Port 587 -To "pennyvz@gmail.com" -From "pennyvz@gmail.com" -Subject "Daily Commit Compliance Report - $reportDate" -Body $emailBody -BodyAsHtml -Encoding Utf8 -Credential $smtpCredential -UseSsl
+    Write-Host "Success: Compliance report email dispatched successfully!" -ForegroundColor Green
 } catch {
     Write-Host "Failed to dispatch compliance email: $_" -ForegroundColor Red
 }
