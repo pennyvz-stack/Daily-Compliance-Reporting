@@ -197,7 +197,7 @@ try {
     Write-Host "Establishing secure TLS connection to Gmail SMTP Gateway..." -ForegroundColor Cyan
     
     # !!! INSERT YOUR 16-CHARACTER GMAIL APP PASSWORD HERE !!!
-    $plainPassword = "vkhjikstwyskpgte" 
+    $plainPassword = "xxx" 
     
     $mail = New-Object System.Net.Mail.MailMessage
     $mail.From = New-Object System.Net.Mail.MailAddress("pennyvz@gmail.com")

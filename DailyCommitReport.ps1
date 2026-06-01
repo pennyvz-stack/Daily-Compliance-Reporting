@@ -1,118 +1,160 @@
 # ==============================================================================
-# DAILY COMMIT COMPLIANCE REPORT - PRODUCTION ENTERPRISE EDITION
+# DAILY COMMIT COMPLIANCE REPORT - FULLY INTERACTIVE COMPLIANCE ENGINE
 # ==============================================================================
 
-# ---- 1. CORE CONFIGURATION ----
-$owner = "pennyvz-stack"
-$repo  = "Daily-Compliance-Reporting"
+# ---- 1. CORE ENTERPRISE CONFIGURATION & INTERACTIVE PROMPT ----
+$owner      = "pennyvz-stack"
+$sqlServer  = "DESKTOP-LQEABPI\TEST"
+$database   = "DBA_Tools"
+$gmailUser  = "pennyvz@gmail.com"
 
-# ---- 2. SECURE INTERACTIVE CREDENTIAL PROMPT ----
+# Build an interactive Windows Choice Prompt for the operational mode
+$Host.UI.RawUI.WindowTitle = "Daily Commit Compliance Engine"
 Write-Host "====================================================" -ForegroundColor Cyan
-Write-Host "   DAILY COMMIT REPORT - SMTP SECURITY AUTH" -ForegroundColor Cyan
+Write-Host "   SELECT OPERATIONAL EXECUTION MODE"               -ForegroundColor Cyan
 Write-Host "====================================================" -ForegroundColor Cyan
+Write-Host " 1) Test Run       - Audit target window forced to TODAY" -ForegroundColor Yellow
+Write-Host " 2) Production Run - Automated rolling lookback (Yesterday/Friday/Holidays)" -ForegroundColor Green
 Write-Host ""
 
-# Prompt safely for your fresh Gmail App Password (or Corporate Relay Account)
-$gmailUser = "pennyvz@gmail.com"
-Write-Host "Please enter your fresh Gmail App Password for email relay:" -ForegroundColor Yellow
+$choice = $null
+while ($choice -notin 1, 2) {
+    $input = Read-Host "Enter selection (1 or 2)"
+    if ($input -eq "1") { $choice = 1; $TestMode = $true }
+    if ($input -eq "2") { $choice = 2; $TestMode = $false }
+}
+
+# ---- 2. DYNAMIC SECURE AUTHENTICATION ENGINE ----
+Write-Host ""
+Write-Host "====================================================" -ForegroundColor Cyan
+Write-Host "   INITIALIZING SECURE HANDSHAKE GATEWAY"            -ForegroundColor Cyan
+Write-Host "====================================================" -ForegroundColor Cyan
+Write-Host ""
+Write-Host "Please enter your Gmail App Password in the Windows secure prompt:" -ForegroundColor Yellow
+
+# Pops open the standard secure double-box prompt natively
 $smtpCredential = Get-Credential -UserName $gmailUser -Message "Gmail SMTP Gateway Authentication"
 
+# Safely unpack the encrypted password string straight into memory (never saved to disk)
+$plainPassword = $smtpCredential.GetNetworkCredential().Password
+
+
 # ---- 3. TARGET WINDOW CONFIGURATION (SMART WEEKEND & HOLIDAY LOOKBACK) ----
-$sqlServer = "DESKTOP-LQEABPI\TEST"
-$database  = "DBA_Tools"
-
-# Start by looking back exactly 1 day from today
-$daysToLookBack = -1
-$targetDate = (Get-Date).AddDays($daysToLookBack).Date
-$isBusinessDay = $false
-
-# Keep rolling backward until we find a valid working business day
-while (-not $isBusinessDay) {
-    $dayOfWeek = $targetDate.DayOfWeek
+if ($TestMode) {
+    $targetDate = (Get-Date).Date
     $dateString = $targetDate.ToString("yyyy-MM-dd")
-    
-    # 1. Check if the target day falls on a weekend
-    if ($dayOfWeek -eq "Saturday" -or $dayOfWeek -eq "Sunday") {
-        $daysToLookBack--
-        $targetDate = (Get-Date).AddDays($daysToLookBack).Date
-    } 
-    # 2. Check if the target day is registered in your SQL Holiday Table
-    else {
-        $holidayCheckQuery = "SELECT COUNT(1) FROM dbo.CompanyHolidays WHERE HolidayDate = '$dateString'"
-        try {
-            $isHoliday = Invoke-SqlCmd -ServerInstance $sqlServer -Database $database -Query $holidayCheckQuery -ErrorAction Stop
-            
-            if ($isHoliday[0] -gt 0) {
-                # It's a holiday! Roll back another day and keep checking
-                Write-Host "Holiday detected: $dateString. Rolling lookback window backward." -ForegroundColor Yellow
-                $daysToLookBack--
-                $targetDate = (Get-Date).AddDays($daysToLookBack).Date
-            } else {
-                # Not a weekend, not a holiday: We found our target business day!
+    Write-Host ""
+    Write-Host "[TEST MODE ACTIVE] Forcing tracking window to TODAY's date." -ForegroundColor Yellow
+} else {
+    $daysToLookBack = -1
+    $targetDate = (Get-Date).AddDays($daysToLookBack).Date
+    $isBusinessDay = $false
+
+    while (-not $isBusinessDay) {
+        $dayOfWeek = $targetDate.DayOfWeek
+        $dateString = $targetDate.ToString("yyyy-MM-dd")
+        
+        if ($dayOfWeek -eq "Saturday" -or $dayOfWeek -eq "Sunday") {
+            $daysToLookBack--
+            $targetDate = (Get-Date).AddDays($daysToLookBack).Date
+        } else {
+            $holidayCheckQuery = "SELECT COUNT(1) FROM dbo.CompanyHolidays WHERE HolidayDate = '$dateString'"
+            try {
+                $isHoliday = Invoke-SqlCmd -ServerInstance $sqlServer -Database $database -Query $holidayCheckQuery -ErrorAction Stop
+                if ($isHoliday[0] -gt 0) {
+                    Write-Host "Holiday detected: $dateString. Rolling lookback window backward." -ForegroundColor Yellow
+                    $daysToLookBack--
+                    $targetDate = (Get-Date).AddDays($daysToLookBack).Date
+                } else {
+                    $isBusinessDay = $true
+                }
+            } catch {
+                Write-Host "Database holiday lookup failed. Defaulting to standard day tracking." -ForegroundColor Red
                 $isBusinessDay = $true
             }
-        } catch {
-            # Fallback safety: If the database check fails, trust standard weekend logic and break
-            Write-Host "Database holiday lookup failed. Defaulting to standard day tracking." -ForegroundColor Red
-            $isBusinessDay = $true
         }
     }
 }
 
-# Construct the strict 00:00:00 to 23:59:59 local clock window for the discovered business day
-$fromDate = $targetDate.ToString("yyyy-MM-dd 00:00:00")
-$toDate   = $targetDate.ToString("yyyy-MM-dd 23:59:59")
-
+$sinceUtc = $targetDate.ToString("yyyy-MM-ddT00:00:00Z")
+$untilUtc = $targetDate.ToString("yyyy-MM-ddT23:59:59Z")
 Write-Host "Target tracking window finalized: Audit Date is $dateString" -ForegroundColor Green
 
-# ---- 4. LOCAL GIT LOG INGESTION ----
-$response = @()
+# ---- 4. REREPOSITORY AUTO-DISCOVERY ----
+$discoveryUrl = "https://api.github.com/users/$owner/repos?per_page=100"
+$headers = @{ "User-Agent" = "PowerShell-DBA-Audit Engine" }
+
 try {
-    Set-Location "C:\Daily-Compliance-Reporting"
-    $gitCommits = git log --since="$fromDate" --until="$toDate" --format="%ae|%aI"
-    
-    foreach ($line in $gitCommits) {
-        if ($line) {
-            $parts = $line -split '\|'
-            $response += [PSCustomObject]@{
-                commit = [PSCustomObject]@{
-                    author = [PSCustomObject]@{
-                        email = $parts[0].Trim()
-                        date  = $parts[1].Trim()
-                    }
-                }
-            }
+    $liveCloudRepos = Invoke-RestMethod -Uri $discoveryUrl -Method Get -Headers $headers -ErrorAction Stop
+    foreach ($repo in $liveCloudRepos) {
+        $currentRepoName = $repo.name
+        $checkRepoQuery = "SELECT COUNT(1) FROM dbo.RepositoryRegistry WHERE RepositoryName = '$currentRepoName'"
+        $repoExists = Invoke-SqlCmd -ServerInstance $sqlServer -Database $database -Query $checkRepoQuery -ErrorAction Stop
+        if ($repoExists[0] -eq 0) {
+            $insertRepoQuery = "INSERT INTO dbo.RepositoryRegistry (RepositoryName, IsActive) VALUES ('$currentRepoName', 1);"
+            Invoke-SqlCmd -ServerInstance $sqlServer -Database $database -Query $insertRepoQuery -ErrorAction Stop
         }
     }
-    Write-Host "Success: Loaded commits directly from local Git tracking repository!" -ForegroundColor Green
 } catch {
-    Write-Host "Failed to query local Git repository logs: $_" -ForegroundColor Red
+    Write-Host "Warning: Cloud discovery step failed. Falling back strictly to existing SQL records." -ForegroundColor Red
 }
 
-# ---- 5. DYNAMIC DEVELOPER ROSTER (SQL SERVER) ----
-$query = "SELECT DeveloperEmail, TimeZoneID FROM dbo.DeveloperRegistry WHERE IsActive = 1"
+# ---- 5. LOAD ROSTERS ----
+$repoPullQuery = "SELECT RepositoryName FROM dbo.RepositoryRegistry WHERE IsActive = 1"
+$dbRepos = Invoke-SqlCmd -ServerInstance $sqlServer -Database $database -Query $repoPullQuery
+if ($dbRepos.Count -eq $null) { $repositories = @($dbRepos.RepositoryName) }
+else { $repositories = @($dbRepos | ForEach-Object { $_.RepositoryName }) }
 
-try {
-    $dbRoster = Invoke-SqlCmd -ServerInstance $sqlServer -Database $database -Query $query
-    $developers = @($dbRoster.DeveloperEmail)
-    $developerTimeZones = @{}
-    foreach ($row in $dbRoster) { $developerTimeZones[$row.DeveloperEmail] = $row.TimeZoneID }
-} catch {
-    Write-Host "Database Roster Retrieval Failed: $_" -ForegroundColor Red
-    exit
+$devQuery = "SELECT DeveloperEmail, TimeZoneID FROM dbo.DeveloperRegistry WHERE IsActive = 1"
+$dbRoster = Invoke-SqlCmd -ServerInstance $sqlServer -Database $database -Query $devQuery
+$developers = @($dbRoster.DeveloperEmail)
+$developerTimeZones = @{}
+foreach ($row in $dbRoster) { $developerTimeZones[$row.DeveloperEmail] = $row.TimeZoneID }
+
+# ---- 6. DATA EXTRACTION ----
+$response = @()
+$repoTotals = @{}
+foreach ($repo in $repositories) { $repoTotals[$repo] = 0 }
+
+foreach ($repo in $repositories) {
+    $apiUrl = "https://api.github.com/repos/$owner/$repo/commits?since=$sinceUtc&until=$untilUtc&per_page=100"
+    try {
+        $cloudCommits = Invoke-RestMethod -Uri $apiUrl -Method Get -Headers $headers -ErrorAction Stop
+        foreach ($commitWrap in $cloudCommits) {
+            $email = $commitWrap.commit.author.email
+            $dateStr = $commitWrap.commit.author.date
+            
+            $response += [PSCustomObject]@{
+                repo   = $repo
+                commit = [PSCustomObject]@{
+                    author = [PSCustomObject]@{ email = $email; date = $dateStr }
+                }
+            }
+            if ($developers -contains $email) { $repoTotals[$repo]++ }
+        }
+    } catch {}
 }
 
-# ---- 6. CASE-INSENSITIVE DATA COMPUTATION ----
+# ---- 7. CALCULATE SYSTEM COUNTS & SUB-TOTAL METRICS ----
 $commitCounts = @{}; $lastCommitLocal = @{}
-foreach ($dev in $developers) { $commitCounts[$dev] = 0; $lastCommitLocal[$dev] = $null }
+$devRepoSubtotals = @{} 
 
-foreach ($commit in $response) {
-    $email = $commit.commit.author.email
-    $timestamp = [DateTime]$commit.commit.author.date
+foreach ($dev in $developers) { 
+    $commitCounts[$dev] = 0
+    $lastCommitLocal[$dev] = $null
+    $devRepoSubtotals[$dev] = @{}
+    foreach ($repo in $repositories) { $devRepoSubtotals[$dev][$repo] = 0 }
+}
+
+foreach ($item in $response) {
+    $email = $item.commit.author.email
+    $timestamp = [DateTime]$item.commit.author.date
+    $currentRepo = $item.repo
     
     if ($developers -contains $email) {
         $matchedKey = ($commitCounts.Keys | Where-Object { $_ -eq $email })
         $commitCounts[$matchedKey]++
+        $devRepoSubtotals[$matchedKey][$currentRepo]++
         
         $localTime = [TimeZoneInfo]::ConvertTimeFromUtc($timestamp.ToUniversalTime(), [TimeZoneInfo]::FindSystemTimeZoneById($developerTimeZones[$matchedKey]))
         if ($lastCommitLocal[$matchedKey] -eq $null -or $localTime -gt $lastCommitLocal[$matchedKey]) {
@@ -121,12 +163,26 @@ foreach ($commit in $response) {
     }
 }
 
-# ---- 7. REPORT HTML GENERATION ----
+# ---- 8. GENERATE ITEMIZABLE HTML ROWS ----
 $reportDate = $targetDate.ToString("yyyy-MM-dd")
 $tableRows = ""
-$sortedDevs = $developers | Sort-Object { $lastCommitLocal[$_] } -Descending
+$sortedDevs = $developers | Sort-Object { $commitCounts[$_] } -Descending
 
 foreach ($dev in $sortedDevs) {
+    $subtotalParts = @()
+    foreach ($repo in $repositories) {
+        $count = $devRepoSubtotals[$dev][$repo]
+        if ($count -gt 0) {
+            $subtotalParts += "<li><code>$repo</code>: <strong>$count</strong> commits</li>"
+        }
+    }
+    
+    if ($subtotalParts.Count -gt 0) {
+        $breakdownHtml = "<ul style='margin: 2px 0; padding-left: 15px; font-size: 12px; list-style-type: circle;'>" + ($subtotalParts -join "") + "</ul>"
+    } else {
+        $breakdownHtml = "<span style='font-size:12px; color:#888;'>No active tracking across targets</span>"
+    }
+
     if ($lastCommitLocal[$dev]) {
         $timeStr = $lastCommitLocal[$dev].ToString("yyyy-MM-dd HH:mm:ss")
         $style = ""
@@ -134,23 +190,53 @@ foreach ($dev in $sortedDevs) {
         $timeStr = "<strong>NO COMMITS</strong>"
         $style = " style='color: #cc0000; background-color: #fce8e6;'"
     }
-    $tableRows += "<tr$style><td style='padding: 8px; border: 1px solid #ddd;'>$dev</td><td style='padding: 8px; border: 1px solid #ddd;'>$($developerTimeZones[$dev])</td><td style='padding: 8px; border: 1px solid #ddd; text-align: center;'>$($commitCounts[$dev])</td><td style='padding: 8px; border: 1px solid #ddd;'>$timeStr</td></tr>"
+    
+    $tableRows += "<tr$style>"
+    $tableRows += "<td style='padding: 8px; border: 1px solid #ddd; vertical-align: top;'>$dev</td>"
+    $tableRows += "<td style='padding: 8px; border: 1px solid #ddd; vertical-align: top;'>$($developerTimeZones[$dev])</td>"
+    $tableRows += "<td style='padding: 8px; border: 1px solid #ddd; text-align: center; vertical-align: top;'><strong>$($commitCounts[$dev])</strong></td>"
+    $tableRows += "<td style='padding: 8px; border: 1px solid #ddd; vertical-align: top;'>$breakdownHtml</td>"
+    $tableRows += "<td style='padding: 8px; border: 1px solid #ddd; vertical-align: top;'>$timeStr</td>"
+    $tableRows += "</tr>"
 }
 
-$totalCommits = ($commitCounts.Values | Measure-Object -Sum).Sum
-$tableRows += "<tr style='background-color: #f2f2f2; font-weight: bold;'><td style='padding: 8px; border: 1px solid #ddd;'>TOTAL</td><td style='padding: 8px; border: 1px solid #ddd;'>N/A</td><td style='padding: 8px; border: 1px solid #ddd; text-align: center;'>$totalCommits</td><td style='padding: 8px; border: 1px solid #ddd;'>-</td></tr>"
+$repoBreakdownHtml = "<h3>Enterprise Repository Volume Breakdown (Total Footprint)</h3><ul style='list-style-type: square;'>"
+foreach ($repo in $repositories) {
+    $repoBreakdownHtml += "<li><strong>$repo</strong>: $($repoTotals[$repo]) commits recorded</li>"
+}
+$repoBreakdownHtml += "</ul>"
 
-$emailBody = "<html><head><style>body { font-family: Calibri, Arial, sans-serif; font-size: 14px; color: #333; } table { border-collapse: collapse; width: 100%; max-width: 700px; margin-top: 15px; } th { background-color: #1f4e78; color: white; padding: 10px; text-align: left; border: 1px solid #ddd; }</style></head><body>"
+$totalCommits = ($commitCounts.Values | Measure-Object -Sum).Sum
+$tableRows += "<tr style='background-color: #f2f2f2; font-weight: bold;'><td style='padding: 8px; border: 1px solid #ddd;'>TOTAL VOLUME</td><td style='padding: 8px; border: 1px solid #ddd;'>N/A</td><td style='padding: 8px; border: 1px solid #ddd; text-align: center;'>$totalCommits</td><td style='padding: 8px; border: 1px solid #ddd;'>-</td><td style='padding: 8px; border: 1px solid #ddd;'>-</td></tr>"
+
+$emailBody = "<html><head><style>body { font-family: Calibri, Arial, sans-serif; font-size: 14px; color: #333; } table { border-collapse: collapse; width: 100%; max-width: 900px; margin-top: 15px; } th { background-color: #1f4e78; color: white; padding: 10px; text-align: left; border: 1px solid #ddd; }</style></head><body>"
 $emailBody += "<p>Good morning,</p>"
-$emailBody += "<p>Here is the automated Daily Commit Report auditing developer activity for the business day <strong>$reportDate</strong> within localized end-of-day windows.</p>"
-$emailBody += "<table><thead><tr><th>Developer</th><th>Local Time Zone</th><th style='text-align: center;'>Commits Recorded</th><th>Last Commit (Local Time)</th></tr></thead>"
+$emailBody += "<p>Here is the automated Multi-Repository Daily Commit Report with itemized developer subtotals for the business day <strong>$reportDate</strong>.</p>"
+$emailBody += "<table><thead><tr><th>Developer</th><th>Local Time Zone</th><th style='text-align: center;'>Total Commits</th><th>Repository Subtotals</th><th>Last Commit (Local Time)</th></tr></thead>"
 $emailBody += "<tbody>$tableRows</tbody></table>"
+$emailBody += "<br/>$repoBreakdownHtml"
 $emailBody += "<p style='font-size: 11px; color: #777; margin-top: 25px;'>This is an automated database administration report.</p>"
 $emailBody += "</body></html>"
 
-# ---- 8. MAIL TRANSMISSION ----
+# ---- 9. MAIL TRANSMISSION ENGINE ----
 try {
-    Send-MailMessage -SmtpServer "smtp.gmail.com" -Port 587 -To "pennyvz@gmail.com" -From "pennyvz@gmail.com" -Subject "Daily Commit Compliance Report - $reportDate" -Body $emailBody -BodyAsHtml -Encoding Utf8 -Credential $smtpCredential -UseSsl
+    Write-Host ""
+    Write-Host "Establishing secure TLS connection to Gmail SMTP Gateway..." -ForegroundColor Cyan
+    
+    $mail = New-Object System.Net.Mail.MailMessage
+    $mail.From = New-Object System.Net.Mail.MailAddress($gmailUser)
+    $mail.To.Add($gmailUser)
+    $mail.Subject = "Remote Multi-Repo Commit Compliance Report - $reportDate"
+    $mail.Body = $emailBody
+    $mail.IsBodyHtml = $true
+    $mail.BodyEncoding = [System.Text.Encoding]::UTF8
+
+    $smtp = New-Object System.Net.Mail.SmtpClient("smtp.gmail.com", 587)
+    $smtp.EnableSsl = $true
+    $smtp.Credentials = New-Object System.Net.NetworkCredential($gmailUser, $plainPassword)
+    
+    $smtp.Send($mail)
+    $smtp.Dispose()
     Write-Host "Success: Compliance report email dispatched successfully!" -ForegroundColor Green
 } catch {
     Write-Host "Failed to dispatch compliance email: $_" -ForegroundColor Red
