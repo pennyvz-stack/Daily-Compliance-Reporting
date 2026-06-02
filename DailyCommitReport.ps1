@@ -1,243 +1,175 @@
 # ==============================================================================
-# DAILY COMMIT COMPLIANCE REPORT - FULLY INTERACTIVE COMPLIANCE ENGINE
+# DAILY REPOSITORY AND DEVELOPER COMMIT SUMMARY - FINAL PRODUCTION VERSION
 # ==============================================================================
 
-# ---- 1. CORE ENTERPRISE CONFIGURATION & INTERACTIVE PROMPT ----
-$owner      = "pennyvz-stack"
-$sqlServer  = "DESKTOP-LQEABPI\TEST"
-$database   = "DBA_Tools"
-$gmailUser  = "pennyvz@gmail.com"
+# ---- 1. CONFIGURATION ----
+$owner         = "pennyvz-stack"
+$sqlServer     = "DESKTOP-LQEABPI\TEST"
+$database      = "DBA_Tools"
+$gmailUser     = "pennyvz@gmail.com"
+$dashboardPath = "C:\Daily-Compliance-Reporting\AuditDashboard.html"
+$redStyle      = "color: #cc0000; font-weight: bold;"
 
-# Build an interactive Windows Choice Prompt for the operational mode
+# ---- 2. INTERACTIVE MENU ----
 $Host.UI.RawUI.WindowTitle = "Daily Commit Compliance Engine"
-Write-Host "====================================================" -ForegroundColor Cyan
-Write-Host "   SELECT OPERATIONAL EXECUTION MODE"               -ForegroundColor Cyan
-Write-Host "====================================================" -ForegroundColor Cyan
-Write-Host " 1) Test Run       - Audit target window forced to TODAY" -ForegroundColor Yellow
-Write-Host " 2) Production Run - Automated rolling lookback (Yesterday/Friday/Holidays)" -ForegroundColor Green
-Write-Host ""
+Write-Host "1) Test Run (Force TODAY)" -ForegroundColor Yellow
+Write-Host "2) Production Run (Smart Lookback)" -ForegroundColor Green
+$choice = Read-Host "Enter selection (1 or 2)"
+$TestMode = ($choice -eq "1")
 
-$choice = $null
-while ($choice -notin 1, 2) {
-    $input = Read-Host "Enter selection (1 or 2)"
-    if ($input -eq "1") { $choice = 1; $TestMode = $true }
-    if ($input -eq "2") { $choice = 2; $TestMode = $false }
+# ---- 3. AUTHENTICATION ----
+$gitCredential  = Get-Credential -UserName "GitHub_API_Token" -Message "Enter GitHub Token"
+$githubToken    = $gitCredential.GetNetworkCredential().Password
+$smtpCredential = Get-Credential -UserName $gmailUser -Message "Enter Gmail App Password"
+$appPassword    = $smtpCredential.GetNetworkCredential().Password
+
+# ---- 4. INITIALIZE DATA STRUCTURES ----
+$seenCommits = @{} 
+$devStats    = @{} 
+$repoStats   = @{}
+$repoList    = @()
+
+# Load Roster
+$dbDevs = Invoke-SqlCmd -ServerInstance $sqlServer -Database $database -Query "SELECT DeveloperEmail, TimeZoneID FROM dbo.DeveloperRegistry WHERE IsActive = 1"
+foreach ($d in $dbDevs) { $devStats[$d.DeveloperEmail] = @{ TZ = $d.TimeZoneID; Main = 0; Branch = 0; Last = $null } }
+$devStats["[UNLISTED/SYSTEM]"] = @{ TZ = "N/A"; Main = 0; Branch = 0; Last = $null }
+
+# Load Repos
+$dbRepos = Invoke-SqlCmd -ServerInstance $sqlServer -Database $database -Query "SELECT RepositoryName FROM dbo.RepositoryRegistry WHERE IsActive = 1"
+foreach ($r in @($dbRepos)) { 
+    $repoName = $r.RepositoryName.Trim()
+    $repoList += $repoName
+    $repoStats[$repoName] = @{ Main = 0; Branch = 0; Stale = 0 }
 }
 
-# ---- 2. DYNAMIC SECURE AUTHENTICATION ENGINE ----
-Write-Host ""
-Write-Host "====================================================" -ForegroundColor Cyan
-Write-Host "   INITIALIZING SECURE HANDSHAKE GATEWAY"            -ForegroundColor Cyan
-Write-Host "====================================================" -ForegroundColor Cyan
-Write-Host ""
-Write-Host "Please enter your Gmail App Password in the Windows secure prompt:" -ForegroundColor Yellow
-
-# Pops open the standard secure double-box prompt natively
-$smtpCredential = Get-Credential -UserName $gmailUser -Message "Gmail SMTP Gateway Authentication"
-
-# Safely unpack the encrypted password string straight into memory (never saved to disk)
-$plainPassword = $smtpCredential.GetNetworkCredential().Password
-
-
-# ---- 3. TARGET WINDOW CONFIGURATION (SMART WEEKEND & HOLIDAY LOOKBACK) ----
+# ---- 5. DATE LOGIC ----
 if ($TestMode) {
     $targetDate = (Get-Date).Date
-    $dateString = $targetDate.ToString("yyyy-MM-dd")
-    Write-Host ""
-    Write-Host "[TEST MODE ACTIVE] Forcing tracking window to TODAY's date." -ForegroundColor Yellow
+    Write-Host "Running in TEST MODE (Date: $targetDate)" -ForegroundColor Yellow
 } else {
-    $daysToLookBack = -1
-    $targetDate = (Get-Date).AddDays($daysToLookBack).Date
-    $isBusinessDay = $false
-
-    while (-not $isBusinessDay) {
-        $dayOfWeek = $targetDate.DayOfWeek
-        $dateString = $targetDate.ToString("yyyy-MM-dd")
-        
-        if ($dayOfWeek -eq "Saturday" -or $dayOfWeek -eq "Sunday") {
-            $daysToLookBack--
-            $targetDate = (Get-Date).AddDays($daysToLookBack).Date
-        } else {
-            $holidayCheckQuery = "SELECT COUNT(1) FROM dbo.CompanyHolidays WHERE HolidayDate = '$dateString'"
-            try {
-                $isHoliday = Invoke-SqlCmd -ServerInstance $sqlServer -Database $database -Query $holidayCheckQuery -ErrorAction Stop
-                if ($isHoliday[0] -gt 0) {
-                    Write-Host "Holiday detected: $dateString. Rolling lookback window backward." -ForegroundColor Yellow
-                    $daysToLookBack--
-                    $targetDate = (Get-Date).AddDays($daysToLookBack).Date
-                } else {
-                    $isBusinessDay = $true
-                }
-            } catch {
-                Write-Host "Database holiday lookup failed. Defaulting to standard day tracking." -ForegroundColor Red
-                $isBusinessDay = $true
-            }
-        }
-    }
+    $targetDate = (Get-Date).AddDays(-1).Date
+    Write-Host "Running in PRODUCTION MODE (Date: $targetDate)" -ForegroundColor Green
 }
-
+$dateStr = $targetDate.ToString("MMMM dd, yyyy")
 $sinceUtc = $targetDate.ToString("yyyy-MM-ddT00:00:00Z")
 $untilUtc = $targetDate.ToString("yyyy-MM-ddT23:59:59Z")
-Write-Host "Target tracking window finalized: Audit Date is $dateString" -ForegroundColor Green
+$staleThreshold = (Get-Date).AddDays(-3)
 
-# ---- 4. REREPOSITORY AUTO-DISCOVERY ----
-$discoveryUrl = "https://api.github.com/users/$owner/repos?per_page=100"
-$headers = @{ "User-Agent" = "PowerShell-DBA-Audit Engine" }
+# ---- 6. DATA FETCHING (DEDUPLICATED) ----
+$headers = @{ "Authorization" = "Bearer $githubToken" }
 
-try {
-    $liveCloudRepos = Invoke-RestMethod -Uri $discoveryUrl -Method Get -Headers $headers -ErrorAction Stop
-    foreach ($repo in $liveCloudRepos) {
-        $currentRepoName = $repo.name
-        $checkRepoQuery = "SELECT COUNT(1) FROM dbo.RepositoryRegistry WHERE RepositoryName = '$currentRepoName'"
-        $repoExists = Invoke-SqlCmd -ServerInstance $sqlServer -Database $database -Query $checkRepoQuery -ErrorAction Stop
-        if ($repoExists[0] -eq 0) {
-            $insertRepoQuery = "INSERT INTO dbo.RepositoryRegistry (RepositoryName, IsActive) VALUES ('$currentRepoName', 1);"
-            Invoke-SqlCmd -ServerInstance $sqlServer -Database $database -Query $insertRepoQuery -ErrorAction Stop
-        }
-    }
-} catch {
-    Write-Host "Warning: Cloud discovery step failed. Falling back strictly to existing SQL records." -ForegroundColor Red
-}
-
-# ---- 5. LOAD ROSTERS ----
-$repoPullQuery = "SELECT RepositoryName FROM dbo.RepositoryRegistry WHERE IsActive = 1"
-$dbRepos = Invoke-SqlCmd -ServerInstance $sqlServer -Database $database -Query $repoPullQuery
-if ($dbRepos.Count -eq $null) { $repositories = @($dbRepos.RepositoryName) }
-else { $repositories = @($dbRepos | ForEach-Object { $_.RepositoryName }) }
-
-$devQuery = "SELECT DeveloperEmail, TimeZoneID FROM dbo.DeveloperRegistry WHERE IsActive = 1"
-$dbRoster = Invoke-SqlCmd -ServerInstance $sqlServer -Database $database -Query $devQuery
-$developers = @($dbRoster.DeveloperEmail)
-$developerTimeZones = @{}
-foreach ($row in $dbRoster) { $developerTimeZones[$row.DeveloperEmail] = $row.TimeZoneID }
-
-# ---- 6. DATA EXTRACTION ----
-$response = @()
-$repoTotals = @{}
-foreach ($repo in $repositories) { $repoTotals[$repo] = 0 }
-
-foreach ($repo in $repositories) {
-    $apiUrl = "https://api.github.com/repos/$owner/$repo/commits?since=$sinceUtc&until=$untilUtc&per_page=100"
-    try {
-        $cloudCommits = Invoke-RestMethod -Uri $apiUrl -Method Get -Headers $headers -ErrorAction Stop
-        foreach ($commitWrap in $cloudCommits) {
-            $email = $commitWrap.commit.author.email
-            $dateStr = $commitWrap.commit.author.date
-            
-            $response += [PSCustomObject]@{
-                repo   = $repo
-                commit = [PSCustomObject]@{
-                    author = [PSCustomObject]@{ email = $email; date = $dateStr }
-                }
-            }
-            if ($developers -contains $email) { $repoTotals[$repo]++ }
-        }
-    } catch {}
-}
-
-# ---- 7. CALCULATE SYSTEM COUNTS & SUB-TOTAL METRICS ----
-$commitCounts = @{}; $lastCommitLocal = @{}
-$devRepoSubtotals = @{} 
-
-foreach ($dev in $developers) { 
-    $commitCounts[$dev] = 0
-    $lastCommitLocal[$dev] = $null
-    $devRepoSubtotals[$dev] = @{}
-    foreach ($repo in $repositories) { $devRepoSubtotals[$dev][$repo] = 0 }
-}
-
-foreach ($item in $response) {
-    $email = $item.commit.author.email
-    $timestamp = [DateTime]$item.commit.author.date
-    $currentRepo = $item.repo
+Write-Host "Starting Data Collection..." -ForegroundColor Cyan
+foreach ($repo in $repoList) {
+    Write-Host "Processing Repo: $repo"
+    $branches = Invoke-RestMethod -Uri "https://api.github.com/repos/$owner/$repo/branches" -Headers $headers
     
-    if ($developers -contains $email) {
-        $matchedKey = ($commitCounts.Keys | Where-Object { $_ -eq $email })
-        $commitCounts[$matchedKey]++
-        $devRepoSubtotals[$matchedKey][$currentRepo]++
+    foreach ($b in $branches) {
+        $meta = Invoke-RestMethod -Uri "https://api.github.com/repos/$owner/$repo/branches/$($b.name)" -Headers $headers
         
-        $localTime = [TimeZoneInfo]::ConvertTimeFromUtc($timestamp.ToUniversalTime(), [TimeZoneInfo]::FindSystemTimeZoneById($developerTimeZones[$matchedKey]))
-        if ($lastCommitLocal[$matchedKey] -eq $null -or $localTime -gt $lastCommitLocal[$matchedKey]) {
-            $lastCommitLocal[$matchedKey] = $localTime
+        # Check Stale
+        if ($b.name -ne "main" -and [DateTime]$meta.commit.commit.author.date -lt $staleThreshold) { $repoStats[$repo].Stale++ }
+        
+        # Get Commits
+        $commits = Invoke-RestMethod -Uri "https://api.github.com/repos/$owner/$repo/commits?sha=$($b.name)&since=$sinceUtc&until=$untilUtc" -Headers $headers
+        foreach ($c in $commits) {
+            $sha = $c.sha
+            $type = if ($b.name -eq "main") { "Main" } else { "Branch" }
+            
+            # Deduplication
+            if (-not $seenCommits.ContainsKey($sha)) {
+                $seenCommits[$sha] = @{ Email = $c.commit.author.email; Repo = $repo; Type = $type; Date = [DateTime]$c.commit.committer.date }
+            } elseif ($type -eq "Main") {
+                $seenCommits[$sha].Type = "Main"
+            }
         }
     }
 }
 
-# ---- 8. GENERATE ITEMIZABLE HTML ROWS ----
-$reportDate = $targetDate.ToString("yyyy-MM-dd")
-$tableRows = ""
-$sortedDevs = $developers | Sort-Object { $commitCounts[$_] } -Descending
-
-foreach ($dev in $sortedDevs) {
-    $subtotalParts = @()
-    foreach ($repo in $repositories) {
-        $count = $devRepoSubtotals[$dev][$repo]
-        if ($count -gt 0) {
-            $subtotalParts += "<li><code>$repo</code>: <strong>$count</strong> commits</li>"
-        }
+# ---- 7. STRICT AGGREGATION ----
+Write-Host "Aggregating Totals..." -ForegroundColor Cyan
+foreach ($sha in $seenCommits.Keys) {
+    $c = $seenCommits[$sha]
+    $email = if ($devStats.ContainsKey($c.Email)) { $c.Email } else { "[UNLISTED/SYSTEM]" }
+    
+    if (-not $devStats.ContainsKey($email)) { $devStats[$email] = @{ TZ = "N/A"; Main = 0; Branch = 0; Last = $null } }
+    
+    if ($c.Type -eq "Main") { 
+        $repoStats[$c.Repo].Main++ 
+        $devStats[$email].Main++
+    } else { 
+        $repoStats[$c.Repo].Branch++ 
+        $devStats[$email].Branch++ 
     }
     
-    if ($subtotalParts.Count -gt 0) {
-        $breakdownHtml = "<ul style='margin: 2px 0; padding-left: 15px; font-size: 12px; list-style-type: circle;'>" + ($subtotalParts -join "") + "</ul>"
-    } else {
-        $breakdownHtml = "<span style='font-size:12px; color:#888;'>No active tracking across targets</span>"
-    }
+    if ($devStats[$email].Last -eq $null -or $c.Date -gt $devStats[$email].Last) { $devStats[$email].Last = $c.Date }
+}
 
-    if ($lastCommitLocal[$dev]) {
-        $timeStr = $lastCommitLocal[$dev].ToString("yyyy-MM-dd HH:mm:ss")
-        $style = ""
-    } else {
-        $timeStr = "<strong>NO COMMITS</strong>"
-        $style = " style='color: #cc0000; background-color: #fce8e6;'"
-    }
+# ---- 8. GENERATE HTML TABLES ----
+$totalMain = 0
+$totalBranch = 0
+
+$repoRows = ""
+foreach ($repo in $repoList) {
+    $s = $repoStats[$repo]
+    $totalMain += $s.Main
+    $totalBranch += $s.Branch
+    $staleDisplay = if ($s.Stale -gt 0) { "<span style='$redStyle'>$($s.Stale) Stale [ALERT]</span>" } else { "0 Stale" }
+    $repoRows += "<tr><td style='border:1px solid #ddd; padding:8px;'><strong>$repo</strong></td><td style='border:1px solid #ddd; padding:8px; text-align:center;'>$($s.Main)</td><td style='border:1px solid #ddd; padding:8px; text-align:center;'>$($s.Branch)</td><td style='border:1px solid #ddd; padding:8px; text-align:center;'>$staleDisplay</td></tr>"
+}
+$repoRows += "<tr style='background:#f2f2f2; font-weight:bold;'><td style='border:1px solid #ddd; padding:8px;'>GRAND TOTAL</td><td style='border:1px solid #ddd; padding:8px; text-align:center;'>$totalMain</td><td style='border:1px solid #ddd; padding:8px; text-align:center;'>$totalBranch</td><td style='border:1px solid #ddd; padding:8px;'></td></tr>"
+
+$devRows = ""
+$devTotalMain = 0
+$devTotalBranch = 0
+
+# Sort Logic: 1. No Activity (Top), 2. Active, 3. Unlisted (Bottom)
+$sortedKeys = $devStats.Keys | Sort-Object {
+    if ($_.ToString() -eq "[UNLISTED/SYSTEM]") { 3 }
+    elseif (($devStats[$_].Main + $devStats[$_].Branch) -eq 0) { 1 }
+    else { 2 }
+}
+
+foreach ($email in $sortedKeys) {
+    $d = $devStats[$email]
+    $devTotalMain += $d.Main
+    $devTotalBranch += $d.Branch
+    $lastStr = if ($d.Last -ne $null) { $d.Last.ToString("yyyy-MM-dd HH:mm:ss") } else { "<span style='$redStyle'>NO COMMITS</span>" }
+    $devRows += "<tr><td style='border:1px solid #ddd; padding:8px;'>$email</td><td style='border:1px solid #ddd; padding:8px;'>$($d.TZ)</td><td style='border:1px solid #ddd; padding:8px; text-align:center;'>$($d.Main)</td><td style='border:1px solid #ddd; padding:8px; text-align:center;'>$($d.Branch)</td><td style='border:1px solid #ddd; padding:8px; text-align:center;'>$lastStr</td></tr>"
+}
+$devRows += "<tr style='background:#f2f2f2; font-weight:bold;'><td colspan='2' style='border:1px solid #ddd; padding:8px;'>GRAND TOTAL</td><td style='border:1px solid #ddd; padding:8px; text-align:center;'>$devTotalMain</td><td style='border:1px solid #ddd; padding:8px; text-align:center;'>$devTotalBranch</td><td></td></tr>"
+
+$emailBody = "<html><body style='font-family:Arial, sans-serif; font-size:14px;'>
+    <h3>Daily Repository and Developer Commit Summary ($dateStr)</h3>
     
-    $tableRows += "<tr$style>"
-    $tableRows += "<td style='padding: 8px; border: 1px solid #ddd; vertical-align: top;'>$dev</td>"
-    $tableRows += "<td style='padding: 8px; border: 1px solid #ddd; vertical-align: top;'>$($developerTimeZones[$dev])</td>"
-    $tableRows += "<td style='padding: 8px; border: 1px solid #ddd; text-align: center; vertical-align: top;'><strong>$($commitCounts[$dev])</strong></td>"
-    $tableRows += "<td style='padding: 8px; border: 1px solid #ddd; vertical-align: top;'>$breakdownHtml</td>"
-    $tableRows += "<td style='padding: 8px; border: 1px solid #ddd; vertical-align: top;'>$timeStr</td>"
-    $tableRows += "</tr>"
-}
+    <h4>1. Repository Activity Summary</h4>
+    <p style='font-size:12px;'>Purpose: To monitor repository health, identify dead repositories, and ensure code is consistently committed to designated branches.</p>
+    <table style='border-collapse:collapse; width:100%;'>
+    <tr style='background:#1f4e78; color:white;'><th>Target Repository</th><th>Main Commits</th><th>Branch Commits</th><th>Stale Branches</th></tr>
+    $repoRows</table>
+    
+    <h4>2. Developer Commit Counts</h4>
+    <p style='font-size:12px;'>Purpose: To perform daily audits of developer commits, ensuring consistent team activity and feature progression. <em>Note: Commit times are shown in the developer's local time zone.</em></p>
+    <table style='border-collapse:collapse; width:100%;'>
+    <tr style='background:#1f4e78; color:white;'><th>Developer</th><th>Local Time Zone</th><th>Main Commits</th><th>Branch Commits</th><th>Last Commit</th></tr>
+    $devRows</table>
+    
+    <div style='margin-top:20px; padding:10px; background:#f4f4f4; border:1px solid #ccc; font-size:12px;'>
+        <strong>Legend:</strong>
+        <ul><li><span style='$redStyle'>NO COMMITS</span>: No recorded activity for audited date.</li>
+            <li><span style='$redStyle'>Stale [ALERT]</span>: Branch not pushed in > 3 days.</li>
+            <li>[UNLISTED/SYSTEM]: Commits from authors not in Registry.</li></ul>
+    </div>
+    </body></html>"
 
-$repoBreakdownHtml = "<h3>Enterprise Repository Volume Breakdown (Total Footprint)</h3><ul style='list-style-type: square;'>"
-foreach ($repo in $repositories) {
-    $repoBreakdownHtml += "<li><strong>$repo</strong>: $($repoTotals[$repo]) commits recorded</li>"
-}
-$repoBreakdownHtml += "</ul>"
-
-$totalCommits = ($commitCounts.Values | Measure-Object -Sum).Sum
-$tableRows += "<tr style='background-color: #f2f2f2; font-weight: bold;'><td style='padding: 8px; border: 1px solid #ddd;'>TOTAL VOLUME</td><td style='padding: 8px; border: 1px solid #ddd;'>N/A</td><td style='padding: 8px; border: 1px solid #ddd; text-align: center;'>$totalCommits</td><td style='padding: 8px; border: 1px solid #ddd;'>-</td><td style='padding: 8px; border: 1px solid #ddd;'>-</td></tr>"
-
-$emailBody = "<html><head><style>body { font-family: Calibri, Arial, sans-serif; font-size: 14px; color: #333; } table { border-collapse: collapse; width: 100%; max-width: 900px; margin-top: 15px; } th { background-color: #1f4e78; color: white; padding: 10px; text-align: left; border: 1px solid #ddd; }</style></head><body>"
-$emailBody += "<p>Good morning,</p>"
-$emailBody += "<p>Here is the automated Multi-Repository Daily Commit Report with itemized developer subtotals for the business day <strong>$reportDate</strong>.</p>"
-$emailBody += "<table><thead><tr><th>Developer</th><th>Local Time Zone</th><th style='text-align: center;'>Total Commits</th><th>Repository Subtotals</th><th>Last Commit (Local Time)</th></tr></thead>"
-$emailBody += "<tbody>$tableRows</tbody></table>"
-$emailBody += "<br/>$repoBreakdownHtml"
-$emailBody += "<p style='font-size: 11px; color: #777; margin-top: 25px;'>This is an automated database administration report.</p>"
-$emailBody += "</body></html>"
-
-# ---- 9. MAIL TRANSMISSION ENGINE ----
+# ---- 9. SEND EMAIL ----
+$emailBody | Out-File -FilePath $dashboardPath -Encoding utf8 -Force
 try {
-    Write-Host ""
-    Write-Host "Establishing secure TLS connection to Gmail SMTP Gateway..." -ForegroundColor Cyan
-    
-    $mail = New-Object System.Net.Mail.MailMessage
-    $mail.From = New-Object System.Net.Mail.MailAddress($gmailUser)
-    $mail.To.Add($gmailUser)
-    $mail.Subject = "Remote Multi-Repo Commit Compliance Report - $reportDate"
-    $mail.Body = $emailBody
+    $mail = New-Object System.Net.Mail.MailMessage($gmailUser, $gmailUser, "Daily Repository and Developer Commit Summary - $dateStr", $emailBody)
     $mail.IsBodyHtml = $true
-    $mail.BodyEncoding = [System.Text.Encoding]::UTF8
-
     $smtp = New-Object System.Net.Mail.SmtpClient("smtp.gmail.com", 587)
     $smtp.EnableSsl = $true
-    $smtp.Credentials = New-Object System.Net.NetworkCredential($gmailUser, $plainPassword)
-    
+    $smtp.Credentials = New-Object System.Net.NetworkCredential($gmailUser, $appPassword)
     $smtp.Send($mail)
     $smtp.Dispose()
-    Write-Host "Success: Compliance report email dispatched successfully!" -ForegroundColor Green
-} catch {
-    Write-Host "Failed to dispatch compliance email: $_" -ForegroundColor Red
-}
+    Write-Host "Success! Report sent." -ForegroundColor Green
+} catch { Write-Host "Failed to dispatch: $_" -ForegroundColor Red }
