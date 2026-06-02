@@ -29,13 +29,13 @@ function Send-SimulatedCommits ($repoPath, $userEmail, $developerName, $targetBr
         for ($i = 1; $i -le 2; $i++) {
             if ($developerName -eq "Penny") {
                 # For Penny, write physical lines to a tracker log text file
-                $testFile = Join-Path $repoPath "$($developerName)_batch_marker.txt"
+                $testFile = Join-Path $repoPath "${developerName}_batch_marker.txt"
                 "Commit block $i generated on branch $targetBranch on $(Get-Date)" | Out-File $testFile -Append
                 git add .
-                git commit -m "$developerName: Batch commit #$i on $targetBranch" --quiet
+                git commit -m "${developerName}: Batch commit #$i on $targetBranch" --quiet
             } else {
                 # For Carlos, use --allow-empty to safely simulate his work without conflicting text files
-                git commit --allow-empty -m "$developerName: Optimized batch commit #$i on $targetBranch" --quiet
+                git commit --allow-empty -m "${developerName}: Optimized batch commit #$i on $targetBranch" --quiet
             }
             Start-Sleep -Seconds 1 # Guarantee unique timestamps
         }
